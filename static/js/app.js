@@ -266,7 +266,9 @@ function renderHomeChart(data) {
         tooltip: {
             trigger: 'axis',
             formatter: (params) => {
-                const lines = [params[0].axisValue];
+                const timestamp = params[0].axisValue;
+                const formattedTime = formatTimestamp(timestamp);
+                const lines = [formattedTime];
                 params.forEach((item) => {
                     lines.push(`${item.marker}${item.seriesName}: ${formatCurrency(item.data[1])}`);
                 });
@@ -280,7 +282,10 @@ function renderHomeChart(data) {
         grid: { left: 40, right: 20, top: 40, bottom: 40 },
         xAxis: {
             type: 'time',
-            axisLabel: { color: '#9ca3af' }
+            axisLabel: { 
+                color: '#9ca3af',
+                formatter: (value) => formatTimestamp(value)
+            }
         },
         yAxis: {
             type: 'value',
@@ -409,13 +414,18 @@ async function updateModelBalanceChart() {
                 trigger: 'axis',
                 formatter: (params) => {
                     if (!params[0]) return '';
-                    return `${params[0].axisValue}<br/>${formatCurrency(params[0].data[1])}`;
+                    const timestamp = params[0].axisValue;
+                    const formattedTime = formatTimestamp(timestamp);
+                    return `${formattedTime}<br/>DeepSeek 策略: ${formatCurrency(params[0].data[1])}`;
                 }
             },
             grid: { left: 40, right: 20, top: 30, bottom: 40 },
             xAxis: {
                 type: 'time',
-                axisLabel: { color: '#9ca3af' }
+                axisLabel: { 
+                    color: '#9ca3af',
+                    formatter: (value) => formatTimestamp(value)
+                }
             },
             yAxis: {
                 type: 'value',
@@ -644,6 +654,45 @@ async function pollData() {
 
 function formatCurrency(value) {
     return `$${Number(value || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatTimestamp(timestamp) {
+    if (!timestamp) return '--';
+    
+    // 如果是数字时间戳（毫秒）
+    if (typeof timestamp === 'number') {
+        return new Date(timestamp).toLocaleString('zh-CN', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+    }
+    
+    // 如果是字符串时间戳
+    if (typeof timestamp === 'string') {
+        // 检查是否是 'YYYY-MM-DD HH:MM:SS' 格式
+        if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(timestamp)) {
+            return timestamp;
+        }
+        
+        // 尝试解析为日期
+        const date = new Date(timestamp);
+        if (!isNaN(date.getTime())) {
+            return date.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+    }
+    
+    return timestamp.toString();
 }
 
 function formatChange(changeAbs, changePct) {

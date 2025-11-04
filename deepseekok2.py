@@ -124,10 +124,12 @@ class ModelContext:
                     'total_trades': 0,
                     'current_leverage': config['leverage_default'],
                     'suggested_leverage': config['leverage_default'],
-                'leverage_history': [],
-                'last_order_value': 0,
-                'last_order_quantity': 0
-            },
+                    'leverage_history': [],
+                    'last_order_value': 0,
+                    'last_order_quantity': 0,
+                    'last_order_contracts': 0,
+                    'price_change': 0
+                },
             'kline_data': [],
             'profit_curve': [],
             'analysis_records': [],
@@ -307,6 +309,13 @@ TRADE_CONFIGS = {
     }
 }
 
+# 币种价格显示精度配置（小数位数）
+PRICE_DECIMALS = {
+    'DOGE/USDT:USDT': 4,  # DOGE使用4位小数
+    'XRP/USDT:USDT': 4,   # XRP使用4位小数
+    # 其他币种默认使用2位小数
+}
+
 # 单交易对兼容模式（向后兼容）
 TRADE_CONFIG = TRADE_CONFIGS['BTC/USDT:USDT']
 
@@ -327,6 +336,75 @@ overview_state = {
 # 线程锁保护共享数据（跨模型共享）
 data_lock = threading.Lock()
 order_execution_lock = threading.Lock()
+
+# ==================== P0级风险控制增强 ====================
+
+class RiskManager:
+    """全局风险管理器（P0-2）"""
+    def __init__(self, max_total_risk_pct=0.30, max_symbol_risk_pct=0.15):
+        self.max_total_risk_pct = max_total_risk_pct  # 总风险敞口不超过30%
+        self.max_symbol_risk_pct = max_symbol_risk_pct  # 单交易对不超过15%
+        self.lock = threading.Lock()
+    
+    def can_open_position(self, exchange_client, symbol: str, trade_value: float, leverage: int) -> bool:
+        """检查是否可以开仓（全局风险限制）"""
+        with self.lock:
+            try:
+                # 1. 获取账户权益
+                balance = exchange_client.fetch_balance()
+                usdt_details = None
+                if 'info' in balance and 'data' in balance['info']:
+                    for data_item in balance['info']['data']:
+                        if 'details' in data_item:
+                            for detail in data_item['details']:
+                                if detail.get('ccy') == 'USDT':
+                                    usdt_details = detail
+                                    break
+                
+                if not usdt_details:
+                    print(f"[风险管理器] ⚠️ 无法获取账户详情，放行")
+                    return True
+                
+                total_equity = float(usdt_details.get('eq', 0))
+                if total_equity <= 0:
+                    print(f"[风险管理器] ❌ 账户权益为0，拒绝开仓")
+                    return False
+                
+                # 2. 计算当前总风险敞口
+                total_exposure = 0
+                all_positions = exchange_client.fetch_positions()
+                for pos in all_positions:
+                    if pos['contracts'] and float(pos['contracts']) > 0:
+                        pos_value = float(pos['contracts']) * float(pos['contractSize']) * float(pos.get('markPrice', pos.get('entryPrice', 0)))
+                        total_exposure += pos_value
+                
+                # 3. 计算新增风险敞口
+                new_total_exposure = total_exposure + trade_value
+                total_risk_ratio = new_total_exposure / total_equity
+                
+                # 4. 全局风险检查
+                if total_risk_ratio > self.max_total_risk_pct:
+                    print(f"[风险管理器] ❌ 全局风险超限: {total_risk_ratio:.1%} > {self.max_total_risk_pct:.1%}")
+                    print(f"[风险管理器]    当前敞口: ${total_exposure:.2f}, 新增: ${trade_value:.2f}, 总权益: ${total_equity:.2f}")
+                    return False
+                
+                # 5. 单交易对风险检查
+                symbol_risk_ratio = trade_value / total_equity
+                if symbol_risk_ratio > self.max_symbol_risk_pct:
+                    print(f"[风险管理器] ❌ {symbol}单品种风险超限: {symbol_risk_ratio:.1%} > {self.max_symbol_risk_pct:.1%}")
+                    return False
+                
+                print(f"[风险管理器] ✅ 风险检查通过 - 总敞口: {total_risk_ratio:.1%}, 单品种: {symbol_risk_ratio:.1%}")
+                return True
+                
+            except Exception as e:
+                print(f"[风险管理器] ⚠️ 风险检查异常: {e}，放行")
+                import traceback
+                traceback.print_exc()
+                return True
+
+# 初始化全局风险管理器
+risk_manager = RiskManager(max_total_risk_pct=0.30, max_symbol_risk_pct=0.15)
 
 # 数据持久化目录
 BASE_DIR = Path(__file__).resolve().parent
@@ -462,7 +540,8 @@ def ensure_symbol_state(symbol: str) -> None:
                     'leverage_history': [],
                     'last_order_value': 0,
                     'last_order_quantity': 0,
-                    'last_order_contracts': 0
+                    'last_order_contracts': 0,
+                    'price_change': 0
                 },
                 'kline_data': [],
                 'profit_curve': [],
@@ -478,6 +557,191 @@ def clamp_value(value, min_val, max_val):
 def round_to_step(value, step):
     """四舍五入到指定步长"""
     return round(value / step) * step
+
+
+def check_stop_loss_take_profit(symbol: str, current_price: float, config: dict) -> bool:
+    """检查止损止盈（P0-1）
+    
+    返回True表示触发了止损或止盈，已平仓
+    返回False表示未触发
+    """
+    try:
+        ctx = get_active_context()
+        current_position = get_current_position(symbol)
+        
+        if not current_position:
+            return False
+        
+        # 查找最近一次开仓信号（包含止损止盈价格）
+        history = ctx.signal_history.get(symbol, [])
+        if not history:
+            return False
+        
+        last_signal = None
+        for record in reversed(history):
+            if record.get('signal') in ['BUY', 'SELL']:
+                last_signal = record
+                break
+        
+        if not last_signal:
+            return False
+        
+        stop_loss = last_signal.get('stop_loss', 0)
+        take_profit = last_signal.get('take_profit', 0)
+        
+        if not stop_loss or not take_profit:
+            return False
+        
+        side = current_position.get('side')
+        entry_price = current_position.get('entry_price', 0)
+        
+        # 多头持仓检查
+        if side == 'long':
+            if current_price <= stop_loss:
+                print(f"[{config['display']}] 🛑 触发止损！当前价格 ${current_price:.4f} <= 止损价 ${stop_loss:.4f}")
+                print(f"[{config['display']}]    入场价: ${entry_price:.4f}, 亏损: {((current_price - entry_price) / entry_price * 100):.2f}%")
+                close_position(symbol, "stop_loss", config)
+                return True
+            elif current_price >= take_profit:
+                print(f"[{config['display']}] 🎯 触发止盈！当前价格 ${current_price:.4f} >= 止盈价 ${take_profit:.4f}")
+                print(f"[{config['display']}]    入场价: ${entry_price:.4f}, 盈利: {((current_price - entry_price) / entry_price * 100):.2f}%")
+                close_position(symbol, "take_profit", config)
+                return True
+        
+        # 空头持仓检查
+        elif side == 'short':
+            if current_price >= stop_loss:
+                print(f"[{config['display']}] 🛑 触发止损！当前价格 ${current_price:.4f} >= 止损价 ${stop_loss:.4f}")
+                print(f"[{config['display']}]    入场价: ${entry_price:.4f}, 亏损: {((entry_price - current_price) / entry_price * 100):.2f}%")
+                close_position(symbol, "stop_loss", config)
+                return True
+            elif current_price <= take_profit:
+                print(f"[{config['display']}] 🎯 触发止盈！当前价格 ${current_price:.4f} <= 止盈价 ${take_profit:.4f}")
+                print(f"[{config['display']}]    入场价: ${entry_price:.4f}, 盈利: {((entry_price - current_price) / entry_price * 100):.2f}%")
+                close_position(symbol, "take_profit", config)
+                return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"[{config.get('display', symbol)}] ⚠️ 止损止盈检查异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def close_position(symbol: str, reason: str, config: dict):
+    """平仓（P0-1辅助函数）"""
+    try:
+        position = get_current_position(symbol)
+        if not position:
+            print(f"[{config['display']}] ⚠️ 无持仓，无需平仓")
+            return
+        
+        contracts = float(position.get('size', 0))
+        if contracts <= 0:
+            print(f"[{config['display']}] ⚠️ 持仓数量为0，无需平仓")
+            return
+        
+        side = position.get('side')
+        
+        # 确定平仓方向（多头平仓用sell，空头平仓用buy）
+        close_side = 'sell' if side == 'long' else 'buy'
+        
+        print(f"[{config['display']}] 📤 执行平仓 - 原因: {reason}")
+        print(f"[{config['display']}]    方向: {side} -> {close_side}")
+        print(f"[{config['display']}]    数量: {contracts:.6f} 张")
+        
+        # 使用全局锁保护订单执行
+        with order_execution_lock:
+            exchange.create_market_order(
+                symbol, 
+                close_side, 
+                contracts,
+                params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
+            )
+        
+        print(f"[{config['display']}] ✅ 平仓完成: {reason}")
+        
+        # 更新统计
+        ctx = get_active_context()
+        ctx.metrics['trades_closed'] += 1
+        
+        # 记录平仓历史
+        time.sleep(1)
+        updated_position = get_current_position(symbol)
+        
+        with data_lock:
+            trade_record = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'signal': 'CLOSE',
+                'side': close_side,
+                'price': 0,  # 市价平仓，实际价格由交易所确定
+                'amount': 0,
+                'contracts': contracts,
+                'leverage': position.get('leverage', 1),
+                'confidence': 'AUTO',
+                'reason': f'自动平仓: {reason}'
+            }
+            web_data['symbols'][symbol]['trade_history'].append(trade_record)
+            if len(web_data['symbols'][symbol]['trade_history']) > 100:
+                web_data['symbols'][symbol]['trade_history'].pop(0)
+            
+            web_data['symbols'][symbol]['current_position'] = updated_position
+        
+    except Exception as e:
+        print(f"[{config['display']}] ❌ 平仓失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def detect_abnormal_market(symbol: str, price_data: dict, config: dict) -> tuple:
+    """检测异常市场（P0-3）
+    
+    返回: (is_abnormal: bool, reason: str)
+    """
+    try:
+        technical_data = price_data.get('technical_data', {})
+        
+        # 1. 价格剧烈波动检查（5分钟变化超过5%）
+        price_change = abs(price_data.get('price_change', 0))
+        if price_change > 5:
+            return True, f"价格5分钟变化超过5%: {price_change:+.2f}%"
+        
+        # 2. 成交量异常检查（成交量超过均值5倍）
+        volume_ratio = technical_data.get('volume_ratio', 1)
+        if volume_ratio > 5:
+            return True, f"成交量异常放大{volume_ratio:.1f}倍"
+        
+        # 3. RSI极端值检查
+        rsi = technical_data.get('rsi', 50)
+        if rsi > 90:
+            return True, f"RSI极度超买: {rsi:.1f}"
+        elif rsi < 10:
+            return True, f"RSI极度超卖: {rsi:.1f}"
+        
+        # 4. 布林带极端突破检查
+        bb_position = technical_data.get('bb_position', 0.5)
+        if bb_position > 1.5:
+            return True, f"价格极端突破布林带上轨: {bb_position:.2f}"
+        elif bb_position < -0.5:
+            return True, f"价格极端跌破布林带下轨: {bb_position:.2f}"
+        
+        # 5. 价格跳空检查（与前一周期价格差异超过3%）
+        if 'df' in price_data and len(price_data['df']) >= 2:
+            df = price_data['df']
+            last_close = df['close'].iloc[-2] if len(df) >= 2 else 0
+            current_close = df['close'].iloc[-1]
+            if last_close > 0:
+                gap_pct = abs((current_close - last_close) / last_close * 100)
+                if gap_pct > 3:
+                    return True, f"价格跳空{gap_pct:.2f}%"
+        
+        return False, None
+        
+    except Exception as e:
+        print(f"[{config.get('display', symbol)}] ⚠️ 异常市场检测失败: {e}")
+        return False, None
 
 
 def get_symbol_market(symbol: str) -> Dict:
@@ -635,6 +899,11 @@ def format_currency(value: Optional[float], decimals: int = 2) -> str:
     return f"${val:,.{decimals}f}"
 
 
+def get_price_decimals(symbol: str) -> int:
+    """获取币种的价格显示精度（小数位数）"""
+    return PRICE_DECIMALS.get(symbol, 2)  # 默认2位小数
+
+
 def format_sequence(values: List[float], indent: int = 2, per_line: int = 10, decimals: int = 2) -> str:
     if not values:
         return " " * indent + "[]"
@@ -774,13 +1043,16 @@ def format_accuracy_summary(metrics: Dict) -> str:
     return "\n".join(lines)
 
 
-def build_position_suggestion_table(position_suggestions: Dict[str, Dict], config: Dict, asset_name: str) -> str:
+def build_position_suggestion_table(position_suggestions: Dict[str, Dict], config: Dict, asset_name: str, symbol: str = None) -> str:
     lines = []
     leverage_min = config['leverage_min']
     leverage_default = config['leverage_default']
     leverage_max = config['leverage_max']
     min_quantity = position_suggestions.get('min_quantity', config['amount'])
     min_contracts = position_suggestions.get('min_contracts', 0)
+    
+    # 获取价格显示精度
+    price_decimals = get_price_decimals(symbol) if symbol else 2
 
     def row(confidence_label: str, leverage: int) -> str:
         key = f"{confidence_label}_{leverage}"
@@ -803,7 +1075,7 @@ def build_position_suggestion_table(position_suggestions: Dict[str, Dict], confi
     lines.append("")
     usable_margin = position_suggestions.get('usable_margin', position_suggestions.get('available_balance', 0) * 0.8)
     lines.append(
-        f"  账户状态: 可用 {position_suggestions.get('available_balance', 0):.2f} USDT | 可用保证金 {usable_margin:.2f} USDT | 价格 ${position_suggestions.get('current_price', 0):,.2f} | 最小量 {min_quantity} {asset_name} ({min_contracts:.3f} 张)"
+        f"  账户状态: 可用 {position_suggestions.get('available_balance', 0):.2f} USDT | 可用保证金 {usable_margin:.2f} USDT | 价格 ${position_suggestions.get('current_price', 0):,.{price_decimals}f} | 最小量 {min_quantity} {asset_name} ({min_contracts:.3f} 张)"
     )
     lines.append("")
     sections = [
@@ -848,10 +1120,14 @@ def build_professional_prompt(ctx: ModelContext,
     closed_trades = ctx.metrics['trades_closed']
 
     asset_name = config['display'].split('-')[0]
-    position_table = build_position_suggestion_table(position_suggestions, config, asset_name)
+    
+    # 获取币种价格显示精度
+    price_decimals = get_price_decimals(symbol)
+    
+    position_table = build_position_suggestion_table(position_suggestions, config, asset_name, symbol)
 
     if current_position:
-        position_status = f"{current_position.get('side', '--')} {current_position.get('size', 0)} {asset_name} @{format_number(current_position.get('entry_price'))}, 未实现盈亏: {format_number(current_position.get('unrealized_pnl'))} USDT"
+        position_status = f"{current_position.get('side', '--')} {current_position.get('size', 0)} {asset_name} @{format_number(current_position.get('entry_price'), price_decimals)}, 未实现盈亏: {format_number(current_position.get('unrealized_pnl'))} USDT"
     else:
         position_status = "无持仓"
 
@@ -860,16 +1136,16 @@ def build_professional_prompt(ctx: ModelContext,
         f"\n  【系统运行状态】\n  运行时长: {runtime_minutes}分钟 ({runtime_hours:.1f}小时) | AI分析: {ai_calls}次 | 开仓: {ctx.metrics['trades_opened']}次 | 平仓: {closed_trades}次 | 当前持仓: {open_positions}个\n",
         "  ⚠️ 重要: 以下所有时间序列数据按 最旧→最新 排列\n",
         "  【短期序列】最近20周期 = 100分钟 (最旧→最新)\n",
-        "  价格 (USDT):\n" + format_sequence(prices, decimals=2),
-        "\n  5周期均线:\n" + format_sequence(sma5, decimals=2),
-        "\n  20周期均线:\n" + format_sequence(sma20, decimals=2),
+        "  价格 (USDT):\n" + format_sequence(prices, decimals=price_decimals),
+        "\n  5周期均线:\n" + format_sequence(sma5, decimals=price_decimals),
+        "\n  20周期均线:\n" + format_sequence(sma20, decimals=price_decimals),
         "\n  RSI (14周期):\n" + format_sequence(rsi, decimals=2),
         "\n  MACD:\n" + format_sequence(macd, decimals=2),
         "\n  成交量 (" + asset_name + "):\n" + format_sequence(volume, decimals=2),
         "\n  【你的历史判断验证】最近50次 (最旧→最新)\n" + history_table + "\n",
         accuracy_summary + "\n",
         "  【当前市场状况】\n",
-        f"  当前价格: ${price_data['price']:,}\n"
+        f"  当前价格: ${price_data['price']:,.{price_decimals}f}\n"
         f"  当前持仓: {position_status}\n"
         f"  市场情绪: {sentiment_text or '暂无数据'}\n",
         "  技术状态:\n"
@@ -1654,13 +1930,16 @@ def generate_technical_analysis_text(price_data, symbol=None):
     # 检查数据有效性
     def safe_float(value, default=0):
         return float(value) if value and pd.notna(value) else default
+    
+    # 获取价格显示精度
+    price_decimals = get_price_decimals(symbol) if symbol else 2
 
     analysis_text = f"""
     【技术指标分析】
     📈 移动平均线:
-    - 5周期: {safe_float(tech['sma_5']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
-    - 20周期: {safe_float(tech['sma_20']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_20'])) / safe_float(tech['sma_20']) * 100:+.2f}%
-    - 50周期: {safe_float(tech['sma_50']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
+    - 5周期: {safe_float(tech['sma_5']):.{price_decimals}f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
+    - 20周期: {safe_float(tech['sma_20']):.{price_decimals}f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_20'])) / safe_float(tech['sma_20']) * 100:+.2f}%
+    - 50周期: {safe_float(tech['sma_50']):.{price_decimals}f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
 
     🎯 趋势分析:
     - 短期趋势: {trend.get('short_term', 'N/A')}
@@ -1676,8 +1955,8 @@ def generate_technical_analysis_text(price_data, symbol=None):
     🎚️ 布林带位置: {safe_float(tech['bb_position']):.2%} ({'上部' if safe_float(tech['bb_position']) > 0.7 else '下部' if safe_float(tech['bb_position']) < 0.3 else '中部'})
 
     💰 关键水平:
-    - 静态阻力: {safe_float(levels.get('static_resistance', 0)):.2f}
-    - 静态支撑: {safe_float(levels.get('static_support', 0)):.2f}
+    - 静态阻力: {safe_float(levels.get('static_resistance', 0)):.{price_decimals}f}
+    - 静态支撑: {safe_float(levels.get('static_support', 0)):.{price_decimals}f}
     """
     return analysis_text
 
@@ -2306,6 +2585,13 @@ def execute_trade(symbol, signal_data, price_data, config):
             print(f"[{config['display']}]    - 杠杆: {suggested_leverage}x")
             print(f"[{config['display']}]    - 所需保证金: {required_margin:.2f} USDT")
 
+            # ========== P0-2: 全局风险管理检查 ==========
+            trade_value = current_price * trade_amount
+            print(f"\n[{config['display']}] 🛡️ 全局风险管理检查...")
+            if not risk_manager.can_open_position(exchange, symbol, trade_value, suggested_leverage):
+                print(f"[{config['display']}] ❌ 全局风险管理拒绝开仓")
+                return
+            
             # 🆕 在验证通过后才设置杠杆（避免验证失败导致的杠杆副作用）
             current_leverage = current_position['leverage'] if current_position else config['leverage_default']
             if suggested_leverage != current_leverage:
@@ -2349,6 +2635,7 @@ def execute_trade(symbol, signal_data, price_data, config):
                             )
                         elif current_position and current_position['side'] == 'long':
                             print(f"[{config['display']}] 已有多头持仓，保持现状")
+                            return  # 不记录重复交易
                         else:
                             # 无持仓时开多仓
                             print(f"[{config['display']}] 开多仓...")
@@ -2376,6 +2663,7 @@ def execute_trade(symbol, signal_data, price_data, config):
                             )
                         elif current_position and current_position['side'] == 'short':
                             print(f"[{config['display']}] 已有空头持仓，保持现状")
+                            return  # 不记录重复交易
                         else:
                             # 无持仓时开空仓
                             print(f"[{config['display']}] 开空仓...")
@@ -2422,16 +2710,34 @@ def execute_trade(symbol, signal_data, price_data, config):
             # 更新持仓信息
             updated_position = get_current_position(symbol)
             print(f"[{config['display']}] 更新后持仓: {updated_position}")
+            
+            # 🆕 验证持仓变化是否符合预期
+            expected_side = 'long' if signal_data['signal'] == 'BUY' else 'short'
+            if not updated_position:
+                print(f"[{config['display']}] ⚠️ 警告：订单执行后无持仓，可能执行失败")
+                return  # 不记录失败的交易
+            elif updated_position.get('side') != expected_side:
+                print(f"[{config['display']}] ⚠️ 警告：持仓方向({updated_position.get('side')})与预期({expected_side})不符")
+                return  # 不记录异常交易
+            
+            # ✅ 验证通过，记录交易成功
+            print(f"[{config['display']}] ✅ 订单验证通过，持仓方向符合预期: {updated_position.get('side')}")
+            
             ctx = get_active_context()
-            if current_position and not updated_position:
+            # 根据持仓变化更新统计（在验证通过后）
+            if current_position and current_position.get('side') != updated_position.get('side'):
+                # 方向发生变化，算一次平仓+开仓
                 ctx.metrics['trades_closed'] += 1
+                ctx.metrics['trades_opened'] += 1
             elif not current_position and updated_position:
+                # 从无持仓到有持仓
                 ctx.metrics['trades_opened'] += 1
 
             # 记录交易历史（使用线程锁保护）
             trade_record = {
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'signal': signal_data['signal'],
+                'side': 'buy' if signal_data['signal'] == 'BUY' else 'sell',  # 🆕 添加 side 字段供前端显示
                 'price': price_data['price'],
                 'amount': trade_amount,
                 'contracts': trade_contracts,
@@ -2628,7 +2934,42 @@ def run_symbol_cycle(symbol, config):
             print(f"[{config['display']}] ❌ 获取数据失败，跳过")
             return
 
-        print(f"[{config['display']}] 当前价格: ${price_data['price']:,.2f} ({price_data['price_change']:+.2f}%)")
+        price_decimals = get_price_decimals(symbol)
+        print(f"[{config['display']}] 当前价格: ${price_data['price']:,.{price_decimals}f} ({price_data['price_change']:+.2f}%)")
+        
+        # ========== P0-1: 优先检查止损止盈（最高优先级） ==========
+        current_price = price_data['price']
+        if check_stop_loss_take_profit(symbol, current_price, config):
+            print(f"[{config['display']}] ✓ 止损/止盈已触发并执行，跳过本轮AI分析")
+            # 更新Web数据后直接返回
+            with data_lock:
+                web_data['symbols'][symbol].update({
+                    'current_price': current_price,
+                    'kline_data': price_data['kline_data'],
+                    'current_position': get_current_position(symbol),
+                    'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+            return
+        
+        # ========== P0-3: 检测异常市场 ==========
+        is_abnormal, abnormal_reason = detect_abnormal_market(symbol, price_data, config)
+        if is_abnormal:
+            print(f"[{config['display']}] ⚠️ 检测到异常市场: {abnormal_reason}")
+            print(f"[{config['display']}] 🔒 进入保护模式，暂停交易")
+            
+            # 异常行情下优先保护现有持仓（再次检查止损）
+            check_stop_loss_take_profit(symbol, current_price, config)
+            
+            # 更新Web数据后直接返回，跳过AI分析和新交易
+            with data_lock:
+                web_data['symbols'][symbol].update({
+                    'current_price': current_price,
+                    'kline_data': price_data['kline_data'],
+                    'current_position': get_current_position(symbol),
+                    'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+                web_data['symbols'][symbol]['performance']['price_change'] = price_data.get('price_change', 0)
+            return
 
         # 2. AI分析
         signal_data = analyze_with_deepseek(symbol, price_data, config)
@@ -2638,8 +2979,12 @@ def run_symbol_cycle(symbol, config):
             web_data['symbols'][symbol].update({
                 'current_price': price_data['price'],
                 'kline_data': price_data['kline_data'],
+                'current_position': get_current_position(symbol),
                 'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
+            
+            # 更新性能数据中的价格变化
+            web_data['symbols'][symbol]['performance']['price_change'] = price_data.get('price_change', 0)
 
             # 保存AI决策
             ai_decision = {

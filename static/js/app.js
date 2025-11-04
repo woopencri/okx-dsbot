@@ -258,7 +258,16 @@ function renderHomeChart(data) {
             type: 'line',
             smooth: true,
             showSymbol: false,
-            data: points.map((item) => [item.timestamp, item.total_equity])
+            lineStyle: {
+                width: 2
+            },
+            data: points.map((item) => {
+                // 将字符串时间戳转换为数字时间戳（毫秒）
+                const timestamp = typeof item.timestamp === 'string' 
+                    ? new Date(item.timestamp).getTime() 
+                    : item.timestamp;
+                return [timestamp, item.total_equity];
+            })
         });
     });
 
@@ -277,19 +286,29 @@ function renderHomeChart(data) {
         },
         legend: {
             data: legends,
-            textStyle: { color: '#fff' }
+            textStyle: { color: '#fff' },
+            top: 5
         },
-        grid: { left: 40, right: 20, top: 40, bottom: 40 },
+        grid: { left: 60, right: 20, top: 50, bottom: 60 },
         xAxis: {
             type: 'time',
             axisLabel: { 
                 color: '#9ca3af',
-                formatter: (value) => formatTimestamp(value)
+                rotate: 45,
+                formatter: (value) => formatTimeForChart(value, homeRange)
+            },
+            splitLine: {
+                show: false
             }
         },
         yAxis: {
             type: 'value',
-            axisLabel: { color: '#9ca3af', formatter: (value) => `$${value.toFixed(0)}` }
+            axisLabel: { color: '#9ca3af', formatter: (value) => `$${value.toFixed(0)}` },
+            splitLine: {
+                lineStyle: {
+                    color: 'rgba(255, 255, 255, 0.1)'
+                }
+            }
         },
         series
     };
@@ -407,7 +426,13 @@ async function updateModelBalanceChart() {
     try {
         const response = await fetch(`/api/profit_curve?model=${currentModel}&range=${modelRange}`);
         const data = await response.json();
-        const seriesData = (data.series || []).map((item) => [item.timestamp, item.total_equity]);
+        const seriesData = (data.series || []).map((item) => {
+            // 将字符串时间戳转换为数字时间戳（毫秒）
+            const timestamp = typeof item.timestamp === 'string' 
+                ? new Date(item.timestamp).getTime() 
+                : item.timestamp;
+            return [timestamp, item.total_equity];
+        });
 
         const option = {
             tooltip: {
@@ -416,20 +441,29 @@ async function updateModelBalanceChart() {
                     if (!params[0]) return '';
                     const timestamp = params[0].axisValue;
                     const formattedTime = formatTimestamp(timestamp);
-                    return `${formattedTime}<br/>DeepSeek 策略: ${formatCurrency(params[0].data[1])}`;
+                    return `${formattedTime}<br/>总金额: ${formatCurrency(params[0].data[1])}`;
                 }
             },
-            grid: { left: 40, right: 20, top: 30, bottom: 40 },
+            grid: { left: 60, right: 20, top: 30, bottom: 60 },
             xAxis: {
                 type: 'time',
                 axisLabel: { 
                     color: '#9ca3af',
-                    formatter: (value) => formatTimestamp(value)
+                    rotate: 45,
+                    formatter: (value) => formatTimeForChart(value, modelRange)
+                },
+                splitLine: {
+                    show: false
                 }
             },
             yAxis: {
                 type: 'value',
-                axisLabel: { color: '#9ca3af', formatter: (value) => `$${value.toFixed(0)}` }
+                axisLabel: { color: '#9ca3af', formatter: (value) => `$${value.toFixed(0)}` },
+                splitLine: {
+                    lineStyle: {
+                        color: 'rgba(255, 255, 255, 0.1)'
+                    }
+                }
             },
             series: [
                 {
@@ -439,6 +473,10 @@ async function updateModelBalanceChart() {
                     showSymbol: false,
                     areaStyle: {
                         color: 'rgba(26, 115, 232, 0.15)'
+                    },
+                    lineStyle: {
+                        width: 2,
+                        color: '#1a73e8'
                     },
                     data: seriesData
                 }
@@ -693,6 +731,50 @@ function formatTimestamp(timestamp) {
     }
     
     return timestamp.toString();
+}
+
+function formatTimeForChart(timestamp, range) {
+    if (!timestamp) return '--';
+    
+    const date = new Date(timestamp);
+    if (isNaN(date.getTime())) return '--';
+    
+    // 根据时间范围选择合适的格式
+    if (range === '1d') {
+        // 1天：显示小时:分钟
+        return date.toLocaleString('zh-CN', {
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    } else if (range === '7d' || range === '15d') {
+        // 7-15天：显示月-日 时:分
+        return date.toLocaleString('zh-CN', {
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit'
+        }).replace(/\//g, '-');
+    } else if (range === '1m') {
+        // 1个月：显示月-日
+        return date.toLocaleString('zh-CN', {
+            month: '2-digit',
+            day: '2-digit'
+        }).replace(/\//g, '-');
+    } else if (range === '1y' || range === 'all') {
+        // 1年或全部：显示年-月
+        return date.toLocaleString('zh-CN', {
+            year: 'numeric',
+            month: '2-digit'
+        }).replace(/\//g, '-');
+    }
+    
+    // 默认格式：月-日 时:分
+    return date.toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit'
+    }).replace(/\//g, '-');
 }
 
 function formatChange(changeAbs, changePct) {
